@@ -80,8 +80,8 @@ def fetch_folder(course_id: int, parent_id: int = -1, session: requests.Session 
     """
     Recursively list all videos + PDFs in a course.
     The API works like this:
-      parent_id=-1  → returns TOP-LEVEL folders (e.g. 'Home' folder with id=29440)
-      parent_id=29440 → returns children of Home (subfolders or actual videos)
+      parent_id=-1    -> returns TOP-LEVEL folders (e.g. 'Home' folder with id=29440)
+      parent_id=29440 -> returns children of Home (subfolders or actual videos)
     So we recurse by passing item['id'] as the next parent_id.
     """
     s = session or http
@@ -102,7 +102,7 @@ def fetch_folder(course_id: int, parent_id: int = -1, session: requests.Session 
         if mat_type == "FOLDER":
             # only recurse if this folder isn't the same as current parent (avoid loops)
             if item_id != parent_id:
-                log.info(f"  → entering folder: {item.get('Title')} (id={item_id})")
+                log.info(f"  -> entering folder: {item.get('Title')} (id={item_id})")
                 results.extend(fetch_folder(course_id, item_id, s))
         else:
             results.append(item)
@@ -120,20 +120,20 @@ def get_stream_url(course_id: int, video_id: str, quality: str = QUALITY, sessio
         if not data.get("success"):
             return None
         for q in data.get("qualities", []):
-            if q["quality"] == quality:
-                return q["url"]
+            if q.get("quality") == quality:
+                return q.get("url")
         # fallback quality order
         for fallback in ["720p", "480p", "360p", "240p", "1080p"]:
             for q in data.get("qualities", []):
-                if q["quality"] == fallback:
-                    return q["url"]
+                if q.get("quality") == fallback:
+                    return q.get("url")
         return data.get("decoded_video_link")
     except Exception as e:
         log.error(f"playx error: {e}")
         return None
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 def sanitize(name: str) -> str:
     return "".join(c if c.isalnum() or c in " ._-" else "_" for c in name).strip()[:80]
 
@@ -144,7 +144,7 @@ def hms(seconds: float) -> str:
     return f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
 
 
-async def safe_send(bot: Bot, chat_id: str, text: str, **kw):
+async def safe_send(bot: Bot, chat_id: str | int, text: str, **kw):
     """Send with retry on flood wait."""
     for attempt in range(5):
         try:
@@ -156,7 +156,7 @@ async def safe_send(bot: Bot, chat_id: str, text: str, **kw):
                 raise
 
 
-async def safe_send_video(bot: Bot, chat_id: str, path: Path, caption: str):
+async def safe_send_video(bot: Bot, chat_id: str | int, path: Path, caption: str):
     for attempt in range(5):
         try:
             with open(path, "rb") as f:
@@ -181,7 +181,7 @@ async def safe_send_video(bot: Bot, chat_id: str, path: Path, caption: str):
     return False
 
 
-async def safe_send_document(bot: Bot, chat_id: str, path: Path, caption: str):
+async def safe_send_document(bot: Bot, chat_id: str | int, path: Path, caption: str):
     for attempt in range(5):
         try:
             with open(path, "rb") as f:
@@ -202,7 +202,7 @@ async def safe_send_document(bot: Bot, chat_id: str, path: Path, caption: str):
     return False
 
 
-# ── Download worker ───────────────────────────────────────────────────────────
+# ── Download worker ──────────────────────────────────────────────────────────
 def download_hls(m3u8_url: str, out_path: Path) -> bool:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -231,7 +231,7 @@ def download_pdf(url: str, out_path: Path) -> bool:
         return False
 
 
-# ── Main pipeline (runs in executor so bot stays async) ───────────────────────
+# ── Main pipeline (runs in executor so bot stays async) ──────────────────────
 async def run_pipeline(
     bot: Bot,
     requester_id: int,
@@ -247,11 +247,11 @@ async def run_pipeline(
     sess = http
 
     await safe_send(bot, status_chat,
-        f"🔍 Extracting course <b>{course_id}</b>...\n"
+        f"🌐 Extracting course <b>{course_id}</b>...\n"
         f"(recursing through all folders, may take a moment)",
         parse_mode=ParseMode.HTML)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         items = await loop.run_in_executor(None, lambda: fetch_folder(course_id, -1, sess))
     except Exception as e:
@@ -294,7 +294,7 @@ async def run_pipeline(
 
         await safe_send(
             bot, status_chat,
-            f"⬇ [{idx}/{len(videos)}] <b>{title}</b>",
+            f"⏳ [{idx}/{len(videos)}] <b>{title}</b>",
             parse_mode=ParseMode.HTML
         )
 
@@ -302,19 +302,19 @@ async def run_pipeline(
             None, lambda vid=video_id: get_stream_url(course_id, vid, QUALITY, sess)
         )
         if not m3u8:
-            await safe_send(bot, status_chat, f"⚠ No stream for: {title}")
+            await safe_send(bot, status_chat, f"⚠️ No stream for: {title}")
             failed += 1
             continue
 
         ok = await loop.run_in_executor(None, download_hls, m3u8, out_path)
 
         if not ok or not out_path.exists():
-            await safe_send(bot, status_chat, f"⚠ ffmpeg failed: {title}")
+            await safe_send(bot, status_chat, f"⚠️ ffmpeg failed: {title}")
             failed += 1
             continue
 
         size_mb = out_path.stat().st_size / 1_048_576
-        caption  = f"📹 {idx}. {title}\n📦 {size_mb:.1f} MB | Course {course_id}"
+        caption  = f"🎬 {idx}. {title}\n📦 {size_mb:.1f} MB | Course {course_id}"
 
         sent = await safe_send_video(bot, target_chat, out_path, caption)
         if not sent:
@@ -326,7 +326,7 @@ async def run_pipeline(
             done += 1
         else:
             failed += 1
-            await safe_send(bot, status_chat, f"⚠ Upload failed: {title}")
+            await safe_send(bot, status_chat, f"⚠️ Upload failed: {title}")
 
         elapsed = time.time() - start_time
         eta_secs = (elapsed / idx) * (len(videos) - idx) if idx else 0
@@ -372,60 +372,65 @@ async def run_pipeline(
     )
 
 
-# ── Conversation handlers ─────────────────────────────────────────────────────
+# ── Conversation handlers ────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 <b>Course Extractor Bot</b>\n\n"
-        "Send /download to start extracting a course.",
-        parse_mode=ParseMode.HTML
-    )
+    if update.message:
+        await update.message.reply_text(
+            "👋 <b>Course Extractor Bot</b>\n\n"
+            "Send /download to start extracting a course.",
+            parse_mode=ParseMode.HTML
+        )
 
 
 async def download_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    auth_ok = "✅" if (HARDCODED_TOKEN or COOKIE_STR) else "⚠ no auth set"
-    await update.message.reply_text(
-        f"📚 <b>Step 1/2</b> — Enter the <b>Course ID</b>:\n"
-        f"Example: <code>41</code>\n\n"
-        f"🔐 Auth: {auth_ok}",
-        parse_mode=ParseMode.HTML
-    )
+    auth_ok = "✅" if (HARDCODED_TOKEN or COOKIE_STR) else "⚠️ no auth set"
+    if update.message:
+        await update.message.reply_text(
+            f"📥 <b>Step 1/2</b> — Enter the <b>Course ID</b>:\n"
+            f"Example: <code>41</code>\n\n"
+            f"🔑 Auth: {auth_ok}",
+            parse_mode=ParseMode.HTML
+        )
     return ASK_COURSE
 
 
 async def got_course_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    text = update.message.text.strip() if update.message and update.message.text else ""
     if not text.isdigit():
-        await update.message.reply_text("⚠ That's not a valid number. Send the Course ID again:")
+        if update.message:
+            await update.message.reply_text("⚠️ That's not a valid number. Send the Course ID again:")
         return ASK_COURSE
 
     ctx.user_data["course_id"] = int(text)
-    await update.message.reply_text(
-        f"✅ Course ID: <b>{text}</b>\n\n"
-        "📨 <b>Step 2/2</b> — Enter the <b>Target Group/Channel ID</b>:\n"
-        "Example: <code>-1001234567890</code> or <code>@mychannel</code>\n\n"
-        "⚠ Bot must be <b>admin</b> in that group/channel!",
-        parse_mode=ParseMode.HTML
-    )
+    if update.message:
+        await update.message.reply_text(
+            f"✅ Course ID: <b>{text}</b>\n\n"
+            f"📤 <b>Step 2/2</b> — Enter the <b>Target Group/Channel ID</b>:\n"
+            f"Example: <code>-1001234567890</code> or <code>@mychannel</code>\n\n"
+            f"⚠️ Bot must be <b>admin</b> in that group/channel!",
+            parse_mode=ParseMode.HTML
+        )
     return ASK_TARGET
 
 
 async def got_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    target    = update.message.text.strip()
+    target    = update.message.text.strip() if update.message and update.message.text else ""
     course_id = ctx.user_data.get("course_id")
 
-    await update.message.reply_text(
-        f"🚀 <b>Starting!</b>\n"
-        f"📚 Course: <code>{course_id}</code>\n"
-        f"📤 Channel: <code>{target}</code>\n"
-        f"🔐 Auth: {'✅ token set' if HARDCODED_TOKEN else '⚠ no token'}\n\n"
-        f"Progress updates here. Go grab a coffee ☕",
-        parse_mode=ParseMode.HTML
-    )
+    if update.message:
+        await update.message.reply_text(
+            f"🚀 <b>Starting!</b>\n"
+            f"📥 Course: <code>{course_id}</code>\n"
+            f"📤 Channel: <code>{target}</code>\n"
+            f"🔑 Auth: {'✅ token set' if HARDCODED_TOKEN else '⚠️ no token'}\n\n"
+            f"Progress updates here. Go grab a coffee ☕",
+            parse_mode=ParseMode.HTML
+        )
 
     asyncio.create_task(
         run_pipeline(
             bot=ctx.bot,
-            requester_id=update.effective_user.id,
+            requester_id=update.effective_user.id if update.effective_user else 0,
             course_id=course_id,
             target_chat=target,
             cookie_str="",
@@ -436,7 +441,8 @@ async def got_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Cancelled.")
+    if update.message:
+        await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
 
 
@@ -449,13 +455,22 @@ def ping():
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host="0.0.0.0", port=port)
+    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────────────────────
 def main():
-    Thread(target=run_flask, daemon=True).start()
+    # 1. Spin Flask on background daemon thread
+    Thread(target=run_flask, daemon=True, name="FlaskThread").start()
 
+    # 2. FIX FOR PYTHON 3.14: Explicitly initialize and bind event loop to MainThread
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    # 3. Build telegram application
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
