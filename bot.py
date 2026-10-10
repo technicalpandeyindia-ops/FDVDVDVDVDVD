@@ -118,7 +118,11 @@ def fetch_folder(course_id: int, parent_id: int = -1, session: requests.Session 
             results.append(item)
     return results
 
-def get_stream_url(course_id: int, video_id: str, quality: str = QUALITY, session: requests.Session = None) -> str | None:
+def get_stream_urls(course_id: int, video_id: str, quality: str = QUALITY, session: requests.Session = None) -> list[str]:
+    """
+    Extracts all candidate stream URLs in priority order.
+    Bypasses broken 404 CDN variant paths by including the unmanipulated master URL.
+    """
     s = session or http
     url = f"{BASE_URL}/playx"
     params = {"course_id": course_id, "video_id": video_id}
@@ -127,18 +131,46 @@ def get_stream_url(course_id: int, video_id: str, quality: str = QUALITY, sessio
         r.raise_for_status()
         data = r.json()
         if not data.get("success"):
-            return None
-        for q in data.get("qualities", []):
-            if q.get("quality") == quality:
-                return q.get("url")
-        for fallback in ["720p", "480p", "360p", "240p", "1080p"]:
-            for q in data.get("qualities", []):
-                if q.get("quality") == fallback:
-                    return q.get("url")
-        return data.get("decoded_video_link")
+            log.warning(f"playx success=False for video {video_id}: {data}")
+            return []
     except Exception as e:
-        log.error(f"playx error: {e}")
-        return None
+        log.error(f"playx error for video {video_id}: {e}")
+        return []
+
+    candidates = []
+
+    # 1. Primary unmanipulated master playlist URL (highest reliability)
+    for key in ["decoded_video_link", "video_link", "stream_url", "url"]:
+        val = data.get(key)
+        if val and isinstance(val, str) and val not in candidates:
+            candidates.append(val)
+
+    # 2. Explicit requested resolution from qualities list
+    for q in data.get("qualities", []):
+        if q.get("quality") == quality and q.get("url"):
+            u = q.get("url")
+            if u not in candidates:
+                candidates.append(u)
+
+    # 3. Fallback resolutions
+    for fallback in ["720p", "480p", "360p", "240p", "1080p"]:
+        for q in data.get("qualities", []):
+            if q.get("quality") == fallback and q.get("url"):
+                u = q.get("url")
+                if u not in candidates:
+                    candidates.append(u)
+
+    # 4. Cleaned URLs: remove artificial '/480p/', '/720p/', etc. subpaths that trigger CDN 404
+    derived = []
+    for cand in candidates:
+        for q_tag in ["/480p/", "/720p/", "/360p/", "/240p/", "/1080p/"]:
+            if q_tag in cand:
+                cleaned = cand.replace(q_tag, "/")
+                if cleaned not in candidates and cleaned not in derived:
+                    derived.append(cleaned)
+    candidates.extend(derived)
+
+    return candidates
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def sanitize(name: str) -> str:
@@ -204,29 +236,34 @@ async def safe_send_document(bot: Bot, chat_id: str | int, path: Path, caption: 
     return False
 
 # ── Download worker ──────────────────────────────────────────────────────────
-def download_hls(m3u8_url: str, out_path: Path) -> bool:
+def download_hls(candidate_urls: list[str], out_path: Path) -> bool:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     bin_path = shutil.which("ffmpeg") or "ffmpeg"
     header_args = f"User-Agent: {HEADERS['User-Agent']}\r\nReferer: {HEADERS['Referer']}\r\nOrigin: {HEADERS['Origin']}\r\n"
 
-    cmd = [
-        bin_path, "-y",
-        "-headers", header_args,
-        "-loglevel", "error",
-        "-i", m3u8_url,
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        str(out_path)
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-        if result.returncode != 0:
-            log.error(f"ffmpeg failed: code {result.returncode} -> {result.stderr.strip()}")
-            return False
-        return out_path.exists() and out_path.stat().st_size > 0
-    except Exception as e:
-        log.error(f"ffmpeg execution failed: {e}")
-        return False
+    for idx, url in enumerate(candidate_urls, 1):
+        log.info(f"Attempting download candidate #{idx}: {url[:100]}...")
+        cmd = [
+            bin_path, "-y",
+            "-headers", header_args,
+            "-loglevel", "error",
+            "-i", url,
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            str(out_path)
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            if result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+                log.info(f"Download successful via candidate #{idx}")
+                return True
+            log.warning(f"Candidate #{idx} failed (code {result.returncode}): {result.stderr.strip()[:180]}")
+            out_path.unlink(missing_ok=True)
+        except Exception as e:
+            log.warning(f"Candidate #{idx} exception: {e}")
+            out_path.unlink(missing_ok=True)
+
+    return False
 
 def download_pdf(url: str, out_path: Path) -> bool:
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -307,15 +344,15 @@ async def run_pipeline(
             parse_mode=ParseMode.HTML
         )
 
-        m3u8 = await loop.run_in_executor(
-            None, lambda vid=video_id: get_stream_url(course_id, vid, QUALITY, sess)
+        candidates = await loop.run_in_executor(
+            None, lambda vid=video_id: get_stream_urls(course_id, vid, QUALITY, sess)
         )
-        if not m3u8:
+        if not candidates:
             await safe_send(bot, status_chat, f"⚠️ No stream for: {title}")
             failed += 1
             continue
 
-        ok = await loop.run_in_executor(None, download_hls, m3u8, out_path)
+        ok = await loop.run_in_executor(None, download_hls, candidates, out_path)
 
         if not ok or not out_path.exists():
             await safe_send(bot, status_chat, f"⚠️ ffmpeg failed: {title}")
@@ -482,7 +519,6 @@ async def run_bot():
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     log.info("Telegram polling started successfully.")
 
-    # Keep alive until cancelled
     stop_event = asyncio.Event()
     try:
         await stop_event.wait()
