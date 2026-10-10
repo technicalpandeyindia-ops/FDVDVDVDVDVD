@@ -1,4 +1,6 @@
 import os
+import sys
+import shutil
 import asyncio
 import time
 import requests
@@ -21,6 +23,49 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── AUTO-RESOLVE / INSTALL FFMPEG FOR RENDER NON-ROOT ────────────────────────
+def resolve_ffmpeg_binary() -> str:
+    """Finds or auto-provisions a static ffmpeg executable in userland."""
+    bin_path = shutil.which("ffmpeg")
+    if bin_path:
+        return bin_path
+
+    # Attempt 1: static-ffmpeg package if installed
+    try:
+        import static_ffmpeg
+        static_ffmpeg.add_paths()
+        bin_path = shutil.which("ffmpeg")
+        if bin_path:
+            log.info(f"ffmpeg loaded via static_ffmpeg: {bin_path}")
+            return bin_path
+    except Exception:
+        pass
+
+    # Attempt 2: Runtime download of static linux-amd64 ffmpeg binary into /tmp
+    target = Path("/tmp/bin/ffmpeg")
+    if target.exists() and os.access(target, os.X_OK):
+        return str(target)
+
+    log.warning("ffmpeg missing from PATH. Pulling static Linux build into /tmp/bin...")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Fetch verified standalone static ffmpeg
+        url = "https://raw.githubusercontent.com/eugeneware/ffmpeg-static/master/ffmpeg"
+        r = requests.get(url, stream=True, timeout=120)
+        r.raise_for_status()
+        with open(target, "wb") as f:
+            for chunk in r.iter_content(65536):
+                f.write(chunk)
+        target.chmod(0o755)
+        os.environ["PATH"] = f"{target.parent}:{os.environ.get('PATH', '')}"
+        log.info(f"Provisioned static ffmpeg executable to {target}")
+        return str(target)
+    except Exception as ex:
+        log.error(f"Failed to auto-provision ffmpeg binary: {ex}")
+        return "ffmpeg"
+
+FFMPEG_PATH = resolve_ffmpeg_binary()
+
 # ── ENV ──────────────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ["BOT_TOKEN"]
 BASE_URL    = os.environ.get("STUDYBEE_BASE", "https://vidya.studybeepro.site")
@@ -33,14 +78,13 @@ HARDCODED_TOKEN  = os.environ.get("STUDYBEE_TOKEN", "")
 HARDCODED_USERID = os.environ.get("STUDYBEE_USERID", "")
 # ─────────────────────────────────────────────────────────────────────────────
 
-ASK_COURSE, ASK_TARGET = range(2)   # no cookie step — auth is baked in
+ASK_COURSE, ASK_TARGET = range(2)
 
 HEADERS = {
     "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer":      BASE_URL + "/",
     "Origin":       BASE_URL,
 }
-
 
 # ── HTTP session with JWT auth ────────────────────────────────────────────────
 def make_session(token: str = "", userid: str = "") -> requests.Session:
@@ -57,13 +101,11 @@ def make_session(token: str = "", userid: str = "") -> requests.Session:
         s.headers["userid"]        = uid
         s.headers["user-id"]       = uid
 
-    # also inject as cookies — site uses both
     if tok:
         s.cookies.set("token",  tok)
     if uid:
         s.cookies.set("userid", uid)
 
-    # extra cookie string if still needed
     if COOKIE_STR:
         for part in COOKIE_STR.split(";"):
             part = part.strip()
@@ -74,16 +116,8 @@ def make_session(token: str = "", userid: str = "") -> requests.Session:
 
 http = make_session()
 
-
 # ── Course API ────────────────────────────────────────────────────────────────
 def fetch_folder(course_id: int, parent_id: int = -1, session: requests.Session = None) -> list[dict]:
-    """
-    Recursively list all videos + PDFs in a course.
-    The API works like this:
-      parent_id=-1    -> returns TOP-LEVEL folders (e.g. 'Home' folder with id=29440)
-      parent_id=29440 -> returns children of Home (subfolders or actual videos)
-    So we recurse by passing item['id'] as the next parent_id.
-    """
     s = session or http
     url = f"{BASE_URL}/get/folder_contentsv3"
     params = {"course_id": course_id, "parent_id": parent_id, "start": 0}
@@ -97,17 +131,15 @@ def fetch_folder(course_id: int, parent_id: int = -1, session: requests.Session 
 
     results = []
     for item in items:
-        item_id   = int(item.get("id", 0))
-        mat_type  = item.get("material_type", "")
+        item_id  = int(item.get("id", 0))
+        mat_type = item.get("material_type", "")
         if mat_type == "FOLDER":
-            # only recurse if this folder isn't the same as current parent (avoid loops)
             if item_id != parent_id:
                 log.info(f"  -> entering folder: {item.get('Title')} (id={item_id})")
                 results.extend(fetch_folder(course_id, item_id, s))
         else:
             results.append(item)
     return results
-
 
 def get_stream_url(course_id: int, video_id: str, quality: str = QUALITY, session: requests.Session = None) -> str | None:
     s = session or http
@@ -122,7 +154,6 @@ def get_stream_url(course_id: int, video_id: str, quality: str = QUALITY, sessio
         for q in data.get("qualities", []):
             if q.get("quality") == quality:
                 return q.get("url")
-        # fallback quality order
         for fallback in ["720p", "480p", "360p", "240p", "1080p"]:
             for q in data.get("qualities", []):
                 if q.get("quality") == fallback:
@@ -132,20 +163,16 @@ def get_stream_url(course_id: int, video_id: str, quality: str = QUALITY, sessio
         log.error(f"playx error: {e}")
         return None
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def sanitize(name: str) -> str:
     return "".join(c if c.isalnum() or c in " ._-" else "_" for c in name).strip()[:80]
-
 
 def hms(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     return f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
 
-
 async def safe_send(bot: Bot, chat_id: str | int, text: str, **kw):
-    """Send with retry on flood wait."""
     for attempt in range(5):
         try:
             return await bot.send_message(chat_id=chat_id, text=text, **kw)
@@ -154,7 +181,6 @@ async def safe_send(bot: Bot, chat_id: str | int, text: str, **kw):
                 await asyncio.sleep(5 * (attempt + 1))
             else:
                 raise
-
 
 async def safe_send_video(bot: Bot, chat_id: str | int, path: Path, caption: str):
     for attempt in range(5):
@@ -174,12 +200,11 @@ async def safe_send_video(bot: Bot, chat_id: str | int, path: Path, caption: str
             if "Flood" in str(e) or "retry" in str(e).lower():
                 await asyncio.sleep(10 * (attempt + 1))
             elif "file is too big" in str(e).lower():
-                return False  # skip oversized
+                return False
             else:
                 log.error(f"send_video error: {e}")
                 return False
     return False
-
 
 async def safe_send_document(bot: Bot, chat_id: str | int, path: Path, caption: str):
     for attempt in range(5):
@@ -201,21 +226,34 @@ async def safe_send_document(bot: Bot, chat_id: str | int, path: Path, caption: 
                 return False
     return False
 
-
 # ── Download worker ──────────────────────────────────────────────────────────
 def download_hls(m3u8_url: str, out_path: Path) -> bool:
+    global FFMPEG_PATH
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not shutil.which(FFMPEG_PATH) and not Path(FFMPEG_PATH).exists():
+        FFMPEG_PATH = resolve_ffmpeg_binary()
+
+    # Pass spoofed browser headers so CDN streaming servers do not return 403 Forbidden
+    header_args = f"User-Agent: {HEADERS['User-Agent']}\r\nReferer: {HEADERS['Referer']}\r\nOrigin: {HEADERS['Origin']}\r\n"
+
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG_PATH, "-y",
+        "-headers", header_args,
         "-loglevel", "error",
         "-i", m3u8_url,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
         str(out_path)
     ]
-    result = subprocess.run(cmd, capture_output=True, timeout=1800)
-    return result.returncode == 0
-
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        if result.returncode != 0:
+            log.error(f"ffmpeg failed code {result.returncode} -> {result.stderr.strip()}")
+            return False
+        return out_path.exists() and out_path.stat().st_size > 0
+    except Exception as e:
+        log.error(f"ffmpeg invocation exception: {e}")
+        return False
 
 def download_pdf(url: str, out_path: Path) -> bool:
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,20 +268,18 @@ def download_pdf(url: str, out_path: Path) -> bool:
         log.error(f"PDF download error: {e}")
         return False
 
-
-# ── Main pipeline (runs in executor so bot stays async) ──────────────────────
+# ── Main pipeline ─────────────────────────────────────────────────────────────
 async def run_pipeline(
     bot: Bot,
     requester_id: int,
     course_id: int,
     target_chat: str,
-    cookie_str: str = "",   # kept for compat, unused now
+    cookie_str: str = "",
 ):
     status_chat = requester_id
     tmp_dir = Path(f"/tmp/course_{course_id}_{int(time.time())}")
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # use global session with baked-in token/userid
     sess = http
 
     await safe_send(bot, status_chat,
@@ -371,7 +407,6 @@ async def run_pipeline(
         parse_mode=ParseMode.HTML
     )
 
-
 # ── Conversation handlers ────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message:
@@ -380,7 +415,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Send /download to start extracting a course.",
             parse_mode=ParseMode.HTML
         )
-
 
 async def download_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     auth_ok = "✅" if (HARDCODED_TOKEN or COOKIE_STR) else "⚠️ no auth set"
@@ -392,7 +426,6 @@ async def download_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
     return ASK_COURSE
-
 
 async def got_course_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip() if update.message and update.message.text else ""
@@ -411,7 +444,6 @@ async def got_course_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
     return ASK_TARGET
-
 
 async def got_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     target    = update.message.text.strip() if update.message and update.message.text else ""
@@ -439,14 +471,12 @@ async def got_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
-
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
 
-
-# ── Keep-alive Flask server (Render needs HTTP) ───────────────────────────────
+# ── Keep-alive Flask server ───────────────────────────────────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
@@ -457,20 +487,16 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-
 # ── Entry point ──────────────────────────────────────────────────────────────
 def main():
-    # 1. Spin Flask on background daemon thread
     Thread(target=run_flask, daemon=True, name="FlaskThread").start()
 
-    # 2. FIX FOR PYTHON 3.14: Explicitly initialize and bind event loop to MainThread
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-    # 3. Build telegram application
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -487,7 +513,6 @@ def main():
 
     log.info("Bot started.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
