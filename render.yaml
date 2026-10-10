@@ -2,23 +2,10 @@ services:
   - type: web
     name: coursebot
     runtime: python
-    buildCommand: |
-      pip install --break-system-packages -r requirements.txt &&
-      apt-get update -y &&
-      apt-get install -y ffmpeg
+    buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
       - key: STUDYBEE_BASE
         value: https://vidya.studybeepro.site
-      - key: QUALITY
-        value: 720p
-      - key: STUDYBEE_TOKEN
-        sync: false          # JWT token from your account
-      - key: STUDYBEE_USERID
-        sync: false          # your numeric user ID
-      - key: STUDYBEE_COOKIE
-        sync: false          # optional extra cookie string
-    healthCheckPath: /
-    autoDeploy: true

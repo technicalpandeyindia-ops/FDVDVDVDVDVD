@@ -23,48 +23,25 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── AUTO-RESOLVE / INSTALL FFMPEG FOR RENDER NON-ROOT ────────────────────────
-def resolve_ffmpeg_binary() -> str:
-    """Finds or auto-provisions a static ffmpeg executable in userland."""
+# ── INITIALIZE STATIC FFMPEG ─────────────────────────────────────────────────
+def setup_ffmpeg():
     bin_path = shutil.which("ffmpeg")
     if bin_path:
+        log.info(f"System ffmpeg detected: {bin_path}")
         return bin_path
 
-    # Attempt 1: static-ffmpeg package if installed
     try:
         import static_ffmpeg
         static_ffmpeg.add_paths()
         bin_path = shutil.which("ffmpeg")
         if bin_path:
-            log.info(f"ffmpeg loaded via static_ffmpeg: {bin_path}")
+            log.info(f"static-ffmpeg initialized: {bin_path}")
             return bin_path
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"static-ffmpeg setup warning: {e}")
 
-    # Attempt 2: Runtime download of static linux-amd64 ffmpeg binary into /tmp
-    target = Path("/tmp/bin/ffmpeg")
-    if target.exists() and os.access(target, os.X_OK):
-        return str(target)
-
-    log.warning("ffmpeg missing from PATH. Pulling static Linux build into /tmp/bin...")
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # Fetch verified standalone static ffmpeg
-        url = "https://raw.githubusercontent.com/eugeneware/ffmpeg-static/master/ffmpeg"
-        r = requests.get(url, stream=True, timeout=120)
-        r.raise_for_status()
-        with open(target, "wb") as f:
-            for chunk in r.iter_content(65536):
-                f.write(chunk)
-        target.chmod(0o755)
-        os.environ["PATH"] = f"{target.parent}:{os.environ.get('PATH', '')}"
-        log.info(f"Provisioned static ffmpeg executable to {target}")
-        return str(target)
-    except Exception as ex:
-        log.error(f"Failed to auto-provision ffmpeg binary: {ex}")
-        return "ffmpeg"
-
-FFMPEG_PATH = resolve_ffmpeg_binary()
+    log.warning("No pre-installed ffmpeg found in PATH. Will attempt fallback invocation.")
+    return "ffmpeg"
 
 # ── ENV ──────────────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ["BOT_TOKEN"]
@@ -73,7 +50,7 @@ QUALITY     = os.environ.get("QUALITY", "720p")
 COOKIE_STR  = os.environ.get("STUDYBEE_COOKIE", "")
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Hardcoded auth (from token login) ────────────────────────────────────────
+# ── Hardcoded auth ───────────────────────────────────────────────────────────
 HARDCODED_TOKEN  = os.environ.get("STUDYBEE_TOKEN", "")
 HARDCODED_USERID = os.environ.get("STUDYBEE_USERID", "")
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,16 +205,12 @@ async def safe_send_document(bot: Bot, chat_id: str | int, path: Path, caption: 
 
 # ── Download worker ──────────────────────────────────────────────────────────
 def download_hls(m3u8_url: str, out_path: Path) -> bool:
-    global FFMPEG_PATH
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if not shutil.which(FFMPEG_PATH) and not Path(FFMPEG_PATH).exists():
-        FFMPEG_PATH = resolve_ffmpeg_binary()
-
-    # Pass spoofed browser headers so CDN streaming servers do not return 403 Forbidden
+    bin_path = shutil.which("ffmpeg") or "ffmpeg"
     header_args = f"User-Agent: {HEADERS['User-Agent']}\r\nReferer: {HEADERS['Referer']}\r\nOrigin: {HEADERS['Origin']}\r\n"
 
     cmd = [
-        FFMPEG_PATH, "-y",
+        bin_path, "-y",
         "-headers", header_args,
         "-loglevel", "error",
         "-i", m3u8_url,
@@ -248,11 +221,11 @@ def download_hls(m3u8_url: str, out_path: Path) -> bool:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
         if result.returncode != 0:
-            log.error(f"ffmpeg failed code {result.returncode} -> {result.stderr.strip()}")
+            log.error(f"ffmpeg failed: code {result.returncode} -> {result.stderr.strip()}")
             return False
         return out_path.exists() and out_path.stat().st_size > 0
     except Exception as e:
-        log.error(f"ffmpeg invocation exception: {e}")
+        log.error(f"ffmpeg execution failed: {e}")
         return False
 
 def download_pdf(url: str, out_path: Path) -> bool:
@@ -487,16 +460,8 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# ── Entry point ──────────────────────────────────────────────────────────────
-def main():
-    Thread(target=run_flask, daemon=True, name="FlaskThread").start()
-
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
+# ── Pure Async Telegram Bot Runner ────────────────────────────────────────────
+async def run_bot():
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -511,8 +476,29 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv)
 
-    log.info("Bot started.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    log.info("Initializing Telegram bot application...")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    log.info("Telegram polling started successfully.")
+
+    # Keep alive until cancelled
+    stop_event = asyncio.Event()
+    try:
+        await stop_event.wait()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    finally:
+        log.info("Stopping bot gracefully...")
+        if app.updater and app.updater.is_running:
+            await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+def main():
+    setup_ffmpeg()
+    Thread(target=run_flask, daemon=True, name="FlaskThread").start()
+    asyncio.run(run_bot())
 
 if __name__ == "__main__":
     main()
